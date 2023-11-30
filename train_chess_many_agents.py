@@ -1,14 +1,16 @@
 import chess
 import numpy as np
 import random
+import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from tqdm import tqdm
+import collections
 
 # Define the piece values
-PIECE_VALUES = {'p': 1, 'n': 3, 'b': 3, 'r': 5, 'q': 9, 'k': 100}
+PIECE_VALUES = {'p': 1, 'n': 3, 'b': 3, 'r': 5, 'q': 9, 'k': 30}
 
 # Updated action space size
 ACTION_SPACE_SIZE = 4672
@@ -38,70 +40,109 @@ class ChessCNN(nn.Module):
 class EnhancedChessCNN(nn.Module):
     def __init__(self, action_size):
         super(EnhancedChessCNN, self).__init__()
-        # Convolutional layers
-        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1)
+        
+        # Input is now 12 channels, one for each piece type for both colors
+        self.conv1 = nn.Conv2d(12, 32, kernel_size=3, stride=1, padding=1)
         self.bn1 = nn.BatchNorm2d(32)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
         self.bn2 = nn.BatchNorm2d(64)
         self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
         self.bn3 = nn.BatchNorm2d(128)
-        self.conv4 = nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1)
-        self.bn4 = nn.BatchNorm2d(256)
 
-        # Fully connected layers
-        self.fc1 = nn.Linear(256 * 8 * 8, 1024)
-        self.dropout1 = nn.Dropout(p=0.5)
+        # You might experiment with the number of fully connected layers and their sizes
+        self.fc1 = nn.Linear(128 * 8 * 8, 1024)
+        self.dropout1 = nn.Dropout(p=0.3)  # Adjust dropout rate as needed
         self.fc2 = nn.Linear(1024, 512)
-        self.dropout2 = nn.Dropout(p=0.5)
         self.fc3 = nn.Linear(512, action_size)
 
     def forward(self, x):
         x = F.relu(self.bn1(self.conv1(x)))
         x = F.relu(self.bn2(self.conv2(x)))
         x = F.relu(self.bn3(self.conv3(x)))
-        x = F.relu(self.bn4(self.conv4(x)))
         
         x = x.view(x.size(0), -1)  # Flatten the tensor
         
         x = F.relu(self.fc1(x))
         x = self.dropout1(x)
         x = F.relu(self.fc2(x))
-        x = self.dropout2(x)
-        x = self.fc3(x)
+        return self.fc3(x)
 
-        return x
+# Replay Buffer
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.buffer = collections.deque(maxlen=capacity)
 
+    def push(self, state, action, reward, next_state, done):
+        experience = (state, action, reward, next_state, done)
+        self.buffer.append(experience)
 
-# Rest of the functions remain the same
+    def sample(self, batch_size):
+        state, action, reward, next_state, done = zip(*random.sample(self.buffer, batch_size))
+        return state, action, reward, next_state, done
+
+    def __len__(self):
+        return len(self.buffer)
+
 # Function to encode the board state
 def encode_board(board):
-    # Create a 8x8 numpy array to represent the board
-    board_array = np.zeros((1, 8, 8), dtype=np.float32)
+    # Define a mapping from pieces to channels
+    piece_to_channel = {
+        'P': 0, 'N': 1, 'B': 2, 'R': 3, 'Q': 4, 'K': 5,
+        'p': 6, 'n': 7, 'b': 8, 'r': 9, 'q': 10, 'k': 11
+    }
+
+    # Create a 12x8x8 numpy array to represent the board
+    board_array = np.zeros((12, 8, 8), dtype=np.float32)
+
     for i in range(64):
         piece = board.piece_at(i)
         if piece:
-            value = PIECE_VALUES.get(piece.symbol().lower(), 0)
-            if piece.color == chess.WHITE:
-                board_array[0, i // 8, i % 8] = value
-            else:
-                board_array[0, i // 8, i % 8] = -value
+            channel = piece_to_channel[piece.symbol()]
+            board_array[channel, i // 8, i % 8] = 1  # Place the piece in the corresponding channel
+
     return board_array
 
 # Chess environment
 class ChessEnv:
     def __init__(self):
         self.board = chess.Board()
+        self.last_capture_map = self._piece_capture_map()
 
     def reset(self):
         self.board.reset()
+        self.last_capture_map = self._piece_capture_map()
         return encode_board(self.board)
 
+    def _piece_capture_map(self):
+        """Creates a map of pieces on the board with their values."""
+        capture_map = {}
+        for i in range(64):
+            piece = self.board.piece_at(i)
+            if piece:
+                capture_map[i] = PIECE_VALUES.get(piece.symbol().lower(), 0)
+        return capture_map
+
     def step(self, move):
-        taken_piece = self.board.piece_at(move.to_square)
+        # Determine if any piece is lost before making the move
+        lost_piece_value = self._calculate_lost_piece_value(move)
+
         self.board.push(move)
-        reward = 0
+        reward = -lost_piece_value  # Negative reward for losing a piece
+
+        # Positional and mobility rewards
+        mobility_reward = len(self.legal_moves()) / 100  # Scale down the reward
+        center_control_reward = self._evaluate_center_control(move) / 100
+
+        # Update reward with new factors
+        reward += mobility_reward + center_control_reward
+
+        # Check if any opponent's piece is captured
+        taken_piece = self.board.piece_at(move.to_square)
         if taken_piece:
-            reward = PIECE_VALUES.get(taken_piece.symbol().lower(), 0)
+            reward += PIECE_VALUES.get(taken_piece.symbol().lower(), 0)
+
+        self.last_capture_map = self._piece_capture_map()  # Update capture map after the move
+
         done = self.board.is_game_over()
         if done:
             if self.board.result() == "1-0":
@@ -109,11 +150,26 @@ class ChessEnv:
             elif self.board.result() == "0-1":
                 reward += 10  # Positive reward for Black's victory
             else:
-                reward -= 20   # Negative reward for a draw
+                reward -= 10   # Negative reward for a draw
+
         return encode_board(self.board), reward, done
+
+    def _calculate_lost_piece_value(self, move):
+        """Calculate the value of the piece lost in the current move, if any."""
+        current_piece_value = self.last_capture_map.get(move.from_square, 0)
+        new_piece_value = PIECE_VALUES.get(self.board.piece_at(move.to_square).symbol().lower(), 0) if self.board.piece_at(move.to_square) else 0
+        return current_piece_value - new_piece_value if current_piece_value > new_piece_value else 0
 
     def legal_moves(self):
         return list(self.board.legal_moves)
+    
+    def _evaluate_center_control(self, move):
+        center_squares = [chess.D4, chess.E4, chess.D5, chess.E5]
+        control_score = 0
+        for square in center_squares:
+            if move.to_square == square:
+                control_score += 1
+        return control_score
 
 # Function to encode a move into an integer
 def encode_move(move):
@@ -128,62 +184,57 @@ def decode_move(encoded_move, legal_moves):
             return move
     return None
 
-# DQN Agent
 class DQNAgent:
-    def __init__(self, action_size):
+    def __init__(self, action_size, buffer_capacity=10000, batch_size=64):
         self.model = EnhancedChessCNN(action_size)
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
         self.epsilon = 0.9
         self.epsilon_decay = 0.995
         self.epsilon_min = 0.01
         self.gamma = 0.99  # Discount factor
+        self.replay_buffer = ReplayBuffer(buffer_capacity)
+        self.batch_size = batch_size
 
     def select_action(self, state, legal_moves):
         if random.random() <= self.epsilon:
-            # Choose a random legal move within the action space limit
-            filtered_legal_moves = [move for move in legal_moves if encode_move(move) < ACTION_SPACE_SIZE]
-            return encode_move(random.choice(filtered_legal_moves)) if filtered_legal_moves else None
+            # Randomly choose from the legal moves
+            return encode_move(random.choice(legal_moves))
         else:
             state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
             with torch.no_grad():
                 q_values = self.model(state_tensor)
 
-            # Filter for legal moves within the action space limit
-            legal_q_values = []
-            legal_encoded_moves = []
-            for move in legal_moves:
-                encoded_move = encode_move(move)
-                if encoded_move < ACTION_SPACE_SIZE:
-                    legal_q_values.append(q_values[0, encoded_move])
-                    legal_encoded_moves.append(encoded_move)
+            # Create a dictionary of Q-values for legal moves
+            legal_q_values = {encode_move(move): q_values[0, encode_move(move)] for move in legal_moves}
 
-            # Select the move with the highest q-value
             if legal_q_values:
-                best_move_q_value = max(legal_q_values)
-                best_move_index = legal_q_values.index(best_move_q_value)
-                return legal_encoded_moves[best_move_index]
+                # Select the move with the highest Q-value among legal moves
+                best_move = max(legal_q_values, key=legal_q_values.get)
+                return best_move
             else:
-                return None
+                # In case there are no legal Q-values (highly unlikely), choose a random legal move
+                return encode_move(random.choice(legal_moves)) if legal_moves else None
 
-    def train(self, state, action_idx, reward, next_state, done):
-        legal_moves = env.legal_moves()
-        action = decode_move(action_idx, legal_moves)
-        if action is None:
-            # Handle invalid action index if necessary
+    def train(self):
+        if len(self.replay_buffer) < self.batch_size:
             return
-        state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
-        next_state_tensor = torch.tensor(next_state, dtype=torch.float32).unsqueeze(0)
-        action_tensor = torch.tensor(action, dtype=torch.int64).unsqueeze(0)
-        reward_tensor = torch.tensor(reward, dtype=torch.float32).unsqueeze(0)
-        done_tensor = torch.tensor(done, dtype=torch.float32).unsqueeze(0)
+
+        states, action_idxs, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
+
+        # Correcting the conversion to tensors
+        states = torch.tensor(np.stack(states), dtype=torch.float32)
+        next_states = torch.tensor(np.stack(next_states), dtype=torch.float32)
+        actions = torch.tensor(action_idxs, dtype=torch.int64).unsqueeze(1)
+        rewards = torch.tensor(rewards, dtype=torch.float32).unsqueeze(1)
+        dones = torch.tensor(dones, dtype=torch.float32).unsqueeze(1)
 
         # Get predicted Q-values for the current state
-        current_q_values = self.model(state_tensor).gather(1, action_tensor)
+        current_q_values = self.model(states).gather(1, actions)
 
         # Compute the target Q-values
         with torch.no_grad():
-            max_next_q_values = self.model(next_state_tensor).max(1)[0].unsqueeze(1)
-            target_q_values = reward_tensor + (self.gamma * max_next_q_values * (1 - done_tensor))
+            max_next_q_values = self.model(next_states).max(1)[0].unsqueeze(1)
+            target_q_values = rewards + (self.gamma * max_next_q_values * (1 - dones))
 
         # Calculate loss
         loss = F.mse_loss(current_q_values, target_q_values)
@@ -291,17 +342,18 @@ for i in tqdm(range(num_games)):
 
         if action_white in env.legal_moves():
             next_state, reward, done = env.step(action_white)
-            # Apply additional reward or penalty at the end of the game
+            # Push this experience to the replay buffer
+            agent_white.replay_buffer.push(state, action_idx_white, reward, next_state, done)
+            # Train the agent
+            agent_white.train()
+
             if done:
                 result = env.board.result()
                 if result == "1-0":
                     reward += 50 - move_count  # Bonus for fast victory
                 elif result == "0-1":
                     reward -= 10  # Penalty for losing
-                agent_white.train(state, action_idx_white, reward, next_state, done)
-
-        if done:
-            break  # Game over
+                break  # Game over
 
         # Black's turn
         agent_black = random.choice(agents_black)  # Randomly select an agent
@@ -310,14 +362,18 @@ for i in tqdm(range(num_games)):
 
         if action_black in env.legal_moves():
             next_state, reward, done = env.step(action_black)
-            # Apply additional reward or penalty at the end of the game
+            # Push this experience to the replay buffer
+            agent_black.replay_buffer.push(state, action_idx_black, reward, next_state, done)
+            # Train the agent
+            agent_black.train()
+
             if done:
                 result = env.board.result()
                 if result == "0-1":
                     reward += 50 - move_count  # Bonus for fast victory
                 elif result == "1-0":
                     reward -= 10  # Penalty for losing
-                agent_black.train(state, action_idx_black, reward, next_state, done)
+                break  # Game over
 
         state = next_state
 
@@ -341,10 +397,17 @@ for i in tqdm(range(num_games)):
             # Compare the new best models with the current global best
             new_best = compare_models(current_best_model, best_white)
             if new_best != current_best_model:
-                current_best_model = new_best
+                # Doesnt REALLY make it better
+                # current_best_model = new_best
                 improvement_history.append(1)  # Mark improvement
             else:
                 improvement_history.append(0)  # No improvement
+        
+        # Save the model
+        torch.save(best_white.model.state_dict(), f'chess_model{num_games}_{num_agents}_white_{i}.pth')
+        torch.save(best_black.model.state_dict(), f'chess_model{num_games}_{num_agents}_black_{i}.pth')
+
+        current_best_model = best_white
 
 # Print the improvement history at the end
 print("Improvement history:", improvement_history)
