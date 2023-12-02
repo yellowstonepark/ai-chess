@@ -36,11 +36,12 @@ class ChessCNN(nn.Module):
         x = x.view(x.size(0), -1)  # Flatten the tensor
         x = torch.relu(self.fc1(x))
         return self.fc2(x)
-    
+
+# This is a very complex CNN that will be underfitting without tens of thousands of games
 class EnhancedChessCNN(nn.Module):
     def __init__(self, action_size):
         super(EnhancedChessCNN, self).__init__()
-        
+
         # Input is now 12 channels, one for each piece type for both colors
         self.conv1 = nn.Conv2d(12, 32, kernel_size=3, stride=1, padding=1)
         self.bn1 = nn.BatchNorm2d(32)
@@ -66,6 +67,30 @@ class EnhancedChessCNN(nn.Module):
         x = self.dropout1(x)
         x = F.relu(self.fc2(x))
         return self.fc3(x)
+
+class SimplifiedChessCNN(nn.Module):
+    def __init__(self, action_size):
+        super(SimplifiedChessCNN, self).__init__()
+        
+        # Simplifying to fewer channels and layers
+        self.conv1 = nn.Conv2d(12, 16, kernel_size=3, stride=1, padding=1)
+        self.bn1 = nn.BatchNorm2d(16)
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1)
+        self.bn2 = nn.BatchNorm2d(32)
+
+        # Simplifying the fully connected layers
+        self.fc1 = nn.Linear(32 * 8 * 8, 256)
+        self.fc2 = nn.Linear(256, action_size)
+
+    def forward(self, x):
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        
+        x = x.view(x.size(0), -1)  # Flatten the tensor
+        
+        x = F.relu(self.fc1(x))
+        return self.fc2(x)
+
 
 # Replay Buffer
 class ReplayBuffer:
@@ -186,7 +211,10 @@ def decode_move(encoded_move, legal_moves):
 
 class DQNAgent:
     def __init__(self, action_size, buffer_capacity=10000, batch_size=64):
-        self.model = EnhancedChessCNN(action_size)
+        # target_model is used for prediction
+        self.model = SimplifiedChessCNN(action_size)
+        self.target_model = SimplifiedChessCNN(action_size)
+        self.target_model.load_state_dict(self.model.state_dict())
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
         self.epsilon = 0.9
         self.epsilon_decay = 0.995
@@ -233,7 +261,7 @@ class DQNAgent:
 
         # Compute the target Q-values
         with torch.no_grad():
-            max_next_q_values = self.model(next_states).max(1)[0].unsqueeze(1)
+            max_next_q_values = self.target_model(next_states).max(1)[0].unsqueeze(1)
             target_q_values = rewards + (self.gamma * max_next_q_values * (1 - dones))
 
         # Calculate loss
@@ -247,6 +275,10 @@ class DQNAgent:
         # Update epsilon
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
+
+    # Update the target model with the model weights
+    def update_target_model(self):
+        self.target_model.load_state_dict(self.model.state_dict())
 
 # Global variable to keep track of the best model
 current_best_model = None
@@ -387,6 +419,10 @@ for i in tqdm(range(num_games)):
 
     # Every 50 rounds, conduct a tournament
     if i != 0 and i % 50 == 0:
+        # Update the target model for each agent
+        for agent in agents_white + agents_black:
+            agent.update_target_model()
+
         best_white = conduct_tournament(agents_white)
         best_black = conduct_tournament(agents_black)
 
@@ -406,8 +442,6 @@ for i in tqdm(range(num_games)):
         # Save the model
         torch.save(best_white.model.state_dict(), f'chess_model{num_games}_{num_agents}_white_{i}.pth')
         torch.save(best_black.model.state_dict(), f'chess_model{num_games}_{num_agents}_black_{i}.pth')
-
-        current_best_model = best_white
 
 # Print the improvement history at the end
 print("Improvement history:", improvement_history)
