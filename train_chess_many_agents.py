@@ -436,8 +436,10 @@ for i in tqdm(range(num_games)):
                 # Doesnt REALLY make it better
                 # current_best_model = new_best
                 improvement_history.append(1)  # Mark improvement
+                print(1, end=" ")
             else:
                 improvement_history.append(0)  # No improvement
+                print(0, end=" ")
         
         # Save the model
         torch.save(best_white.model.state_dict(), f'chess_model{num_games}_{num_agents}_white_{i}.pth')
